@@ -3,35 +3,91 @@ import numpy as np
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 
-PROC = Path("data/processed")
-PRICES_RET = PROC / "india_asset_returns_log.parquet"
-MACRO = PROC / "macro_fred_india.parquet"
-OUT = PROC / "features_hmm_india.parquet"
+# Paths
+PRICES_RET = Path("data/processed/india_asset_returns_monthly.parquet")
+MACRO = Path("data/processed/macro_fred_india.parquet")
+OUT = Path("data/processed/features_hmm_india.parquet")
 
-rets = pd.read_parquet(PRICES_RET)
-macro = pd.read_parquet(MACRO)
+def build_features():
+    print("--- Building Features for HMM ---")
+    
+    # 1. Load Data
+    if not PRICES_RET.exists() or not MACRO.exists():
+        print("Error: Input files not found. Run previous data fetch scripts.")
+        return
 
-# Align on month-end intersection
-df = rets.join(macro, how="inner")
+    m_ret = pd.read_parquet(PRICES_RET)
+    macro = pd.read_parquet(MACRO)
+    
+    # Identify NIFTY column (First column matching 'NSEI' or 'NIFTY')
+    nifty_candidates = [c for c in m_ret.columns if "NSEI" in c or "NIFTY" in c]
+    if not nifty_candidates:
+        print("Error: No NIFTY/NSEI column found in monthly returns.")
+        return
+    nifty_col = nifty_candidates[0]
+    print(f"Using {nifty_col} as market proxy.")
 
-# Select macro features (example)
-macro_feats = [c for c in macro.columns if ("CPI" in c.upper() or "Gsec" in c or "Repo" in c or "M3" in c or "GDP" in c.upper())]
-# If not found, take all macro columns
-if not macro_feats:
-    macro_feats = list(macro.columns)
+    # 2. Engineer Market Features
+    df_feat = pd.DataFrame(index=m_ret.index)
+    
+    # Volatility (3-month rolling std dev)
+    df_feat["Market_Vol"] = m_ret[nifty_col].rolling(window=3).std()
+    
+    # Momentum (6-month rolling mean)
+    df_feat["Market_Mom"] = m_ret[nifty_col].rolling(window=6).mean()
+    
+    # 3. Engineer Macro Features
+    # FIX 1: Handle pct_change deprecation warning
+    # We forward fill NaNs first so pct_change has clean data
+    macro_filled = macro.ffill()
+    
+    # Calculate YoY Growth (12-month percent change)
+    # fill_method=None explicitly avoids the deprecated behavior
+    macro_growth = macro_filled.pct_change(12, fill_method=None)
+    
+    # FIX 2: Handle Division by Zero (Infinity)
+    # Replace inf with NaN immediately
+    macro_growth = macro_growth.replace([np.inf, -np.inf], np.nan)
 
-features = df[macro_feats].copy()
-features = features.dropna(how="any")
-# Replace any remaining inf values with NaN, then drop
-features = features.replace([np.inf, -np.inf], np.nan)
-features = features.dropna(how="any")
+    # LAG MACRO DATA (Shift forward 1 month to prevent look-ahead bias)
+    macro_shifted = macro_growth.shift(1)
+    
+    # Select specific macro columns
+    # We look for keywords like CPI (Inflation) and Gsec/Yields (Interest Rates)
+    for c in macro_shifted.columns:
+        if "CPI" in c: 
+            df_feat["Inflation_YoY"] = macro_shifted[c]
+        if "Gsec" in c or "Yield" in c: 
+            df_feat["Rates_YoY"] = macro_shifted[c]
+        if "GDP" in c:
+            df_feat["GDP_Growth"] = macro_shifted[c]
 
-if features.empty:
-    raise ValueError("No valid features after removing NaN/inf values")
+    # 4. Clean and Scale
+    # Drop rows where we don't have enough history (e.g., first 12 months)
+    df_final = df_feat.dropna()
+    
+    # Sanity Check for Infinity again just in case
+    if np.isinf(df_final.values).any():
+        print("Warning: Infinity values found. Replacing with 0.")
+        df_final = df_final.replace([np.inf, -np.inf], 0)
 
-scaler = StandardScaler()
-X = scaler.fit_transform(features.values)
-Xdf = pd.DataFrame(X, index=features.index, columns=features.columns)
+    print(f"Final Data Shape before scaling: {df_final.shape}")
+    
+    if df_final.empty:
+        print("Error: DataFrame is empty after dropping NaNs. Check your rolling windows or data alignment.")
+        return
 
-Xdf.to_parquet(OUT)
-print("Saved HMM features to", OUT)
+    # Standardize features
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df_final.values)
+    
+    Xdf = pd.DataFrame(X, index=df_final.index, columns=df_final.columns)
+    
+    # Ensure directory exists
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    Xdf.to_parquet(OUT)
+    print(f"Features saved to {OUT}")
+    print(f"Columns: {Xdf.columns.tolist()}")
+
+if __name__ == "__main__":
+    build_features()

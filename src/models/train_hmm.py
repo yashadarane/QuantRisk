@@ -1,4 +1,3 @@
-# src/models/train_hmm_india.py
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -66,8 +65,6 @@ def main():
         except Exception as e:
             print("Fit failed:", e)
             continue
-        logL = model.score(X) * n_obs  #hmmlearn score returns avg logL per sample
-        #hmmlearn.score returns total log likelihood of sequence
         logL = model.score(X)
         n_params = num_params_gaussian_hmm(n_states, n_features)
         aic, bic = compute_aic_bic(logL, n_params, n_obs)
@@ -108,5 +105,35 @@ def main():
         json.dump(summary, f, indent=2)
     print(f"Saved training summary to {summary_path}")
 
+# ... (After saving the model and regimes) ...
+    
+    # LOAD RETURNS TO INTERPRET STATES
+    # We need to know: Is State 0 good or bad?
+    m_ret = pd.read_parquet("data/processed/india_asset_returns_monthly.parquet")
+    nifty_col = [c for c in m_ret.columns if "NSEI" in c or "NIFTY" in c][0]
+    
+    # Align
+    analysis_df = out_df.join(m_ret[nifty_col], how="inner")
+    
+    print("\n--- STATE INTERPRETATION ---")
+    summary = analysis_df.groupby("regime")[nifty_col].agg(["mean", "std", "count"])
+    # Annualize for readability
+    summary["ann_ret"] = summary["mean"] * 12
+    summary["ann_vol"] = summary["std"] * np.sqrt(12)
+    summary["sharpe"] = summary["ann_ret"] / summary["ann_vol"]
+    
+    print(summary)
+    
+    # AUTOMATICALLY IDENTIFY BULL/BEAR STATES
+    bull_state = summary["sharpe"].idxmax()
+    bear_state = summary["sharpe"].idxmin()
+    
+    print(f"\nDetected Bull State (Highest Sharpe): {bull_state}")
+    print(f"Detected Bear State (Lowest Sharpe): {bear_state}")
+    
+    # Save this mapping for the backtester!
+    mapping = {"bull_state": int(bull_state), "bear_state": int(bear_state)}
+    with open(MODEL_DIR / "state_mapping.json", "w") as f:
+        json.dump(mapping, f)
 if __name__ == "__main__":
     main()

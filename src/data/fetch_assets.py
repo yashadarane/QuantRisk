@@ -1,6 +1,6 @@
 """
-Fetches Indian equity, ETF, and forex data from Yahoo Finance
-Robust to single- and multi-ticker downloads and handles adjusted vs non-adjusted closes.
+FIXED: Fetch DAILY asset data for Indian markets
+The previous version was accidentally creating monthly data
 """
 
 import yfinance as yf
@@ -11,222 +11,234 @@ from pathlib import Path
 from datetime import datetime
 import logging
 
-#set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 def load_config(config_path='config.yaml'):
-    cfg_path = Path(config_path)
-    with open(cfg_path, 'r') as f:
+    """Load configuration from YAML file"""
+    with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
 
 
-def _safe_ticker_list(config):
-    #flatten and deduplicate tickers from config dict
+def fetch_daily_prices(config_path='config.yaml', save=True):
+    """
+    Fetch DAILY Indian asset price data from Yahoo Finance
+    
+    Returns:
+    --------
+    pd.DataFrame : DAILY price data
+    """
+    
+    config = load_config(config_path)
+    
+    # Collect all assets
     all_assets = []
     for category in ['equities', 'bonds', 'commodities', 'international']:
-        if category in config.get('assets', {}):
+        if category in config['assets']:
             all_assets.extend(config['assets'][category])
-    #preserve order, remove duplicates and empty strings
-    return [t for t in list(dict.fromkeys(all_assets)) if t]
+    
+    all_assets = list(dict.fromkeys(all_assets))
+    
+    start = config['start_date']
+    end = config['end_date']
+    
+    logger.info(f"Fetching DAILY data for {len(all_assets)} assets")
+    logger.info(f"Date range: {start} to {end}")
+    logger.info(f"Assets: {', '.join(all_assets)}")
+    
+    try:
+        # Download DAILY data
+        data = yf.download(
+            all_assets, 
+            start=start, 
+            end=end,
+            interval='1d',  # DAILY data
+            group_by='ticker',
+            progress=True,
+            auto_adjust=True
+        )
+        
+        logger.info(f"✓ Successfully downloaded DAILY data")
+        logger.info(f"  Shape: {data.shape}")
+        logger.info(f"  Frequency: {pd.infer_freq(data.index)} (should be 'B' for business daily)")
+        logger.info(f"  Date range: {data.index[0]} to {data.index[-1]}")
+        logger.info(f"  Total days: {len(data)}")
+        
+        # Verify we got daily data
+        days_expected = (pd.Timestamp(end) - pd.Timestamp(start)).days
+        if len(data) < days_expected * 0.5:  # Should have at least 50% of calendar days
+            logger.warning(f"⚠️ Data might not be daily! Only {len(data)} rows for {days_expected} calendar days")
+        
+        if save:
+            output_path = Path('data/raw/india_asset_prices_daily.parquet')
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            data.to_parquet(output_path)
+            logger.info(f"✓ Saved to {output_path}")
+            
+            # Save metadata
+            metadata = {
+                'fetch_date': datetime.now().isoformat(),
+                'assets': all_assets,
+                'start_date': start,
+                'end_date': end,
+                'frequency': 'daily',
+                'n_rows': len(data),
+                'n_assets': len(all_assets)
+            }
+            
+            metadata_path = Path('data/raw/india_asset_prices_daily_metadata.yaml')
+            with open(metadata_path, 'w') as f:
+                yaml.dump(metadata, f)
+        
+        return data
+        
+    except Exception as e:
+        logger.error(f"✗ Failed to fetch asset data: {e}")
+        raise
 
 
-def _select_price_column(df, prefer_adjusted=True):
-    if prefer_adjusted:
-        if 'Adj Close' in df.columns:
-            return df['Adj Close']
-        if 'Close' in df.columns:
-            return df['Close']
-    else:
-        if 'Close' in df.columns:
-            return df['Close']
-        if 'Adj Close' in df.columns:
-            return df['Adj Close']
-    # fallback: try first numeric column
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    if numeric_cols:
-        return df[numeric_cols[0]]
-    raise ValueError("No usable price column found in dataframe.")
-
-
-def fetch_india_assets(config_path='config.yaml', save=True, prefer_adjusted=True):
+def compute_daily_returns(data, save=True):
     """
-    Fetch Indian asset price data from Yahoo Finance
-
+    Compute DAILY log returns from price data
+    
+    Parameters:
+    -----------
+    data : pd.DataFrame
+        DAILY price data
+        
     Returns:
-        pd.DataFrame: Price data with MultiIndex columns if multiple tickers,
-                      or a single-ticker DataFrame
+    --------
+    pd.DataFrame : DAILY log returns
     """
-    config = load_config(config_path)
-    tickers = _safe_ticker_list(config)
-    if not tickers:
-        raise ValueError("No tickers found in config['assets'].")
-
-    start = config.get('start_date', '2005-01-01')
-    end = config.get('end_date', None)
-
-    logger.info(f"Fetching data for {len(tickers)} assets from {start} to {end}")
-    logger.info(f"Assets: {', '.join(tickers)}")
-
-
-    data = yf.download(
-        tickers,
-        start=start,
-        end=end,
-        group_by='ticker',
-        progress=False,
-        auto_adjust=False,  
-        threads=True
-    )
-
+    
+    logger.info(f"Computing DAILY log returns...")
+    
+    # Handle both single asset and multi-asset DataFrames
     if isinstance(data.columns, pd.MultiIndex):
-        logger.info("Multi-ticker download detected (MultiIndex columns).")
+        prices = data.xs('Close', level=1, axis=1)
     else:
-        logger.info("Single-ticker or flat dataframe returned by yfinance.")
-
-    price_df = pd.DataFrame(index=data.index.unique()).sort_index()
-
-    missing_tickers = []
-    for t in tickers:
-        try:
-            if isinstance(data.columns, pd.MultiIndex) and t in data.columns.levels[0]:
-                df_t = data[t].copy()
-            else:
-                df_t = data.copy()
-            if 'Adj Close' in df_t.columns:
-                prices = df_t['Adj Close']
-            elif 'Close' in df_t.columns:
-                prices = df_t['Close']
-            else:
-                prices = _select_price_column(df_t, prefer_adjusted=True)
-
-            prices = prices.dropna(how='all')
-            prices.index = pd.to_datetime(prices.index)
-            prices = prices.sort_index()
-            price_df = price_df.join(prices.rename(t), how='outer')
-        except Exception as e:
-            logger.warning(f"Failed to extract prices for {t}: {e}")
-            missing_tickers.append(t)
-
-    if missing_tickers:
-        logger.warning(f"No usable data for tickers: {missing_tickers}")
-
-    #basic sanity checks
-    if price_df.empty or price_df.dropna(how='all').empty:
-        raise RuntimeError("Downloaded data contains no valid price series.")
-
-    non_null = price_df.dropna(how='all', axis=1)
-    logger.info(f"✓ Price frame shape: {price_df.shape}")
-    logger.info(f"✓ Date range: {price_df.index.min().date()} -> {price_df.index.max().date()}")
-    logger.info(f"✓ Number of tickers with data: {len(non_null.columns)}")
-
-    # Optionally save raw DataFrame (wide format)
+        prices = data['Close']
+    
+    # Compute log returns
+    returns = np.log(prices / prices.shift(1))
+    
+    # Remove first row (NaN)
+    returns = returns.dropna()
+    
+    logger.info(f"✓ Computed DAILY returns")
+    logger.info(f"  Shape: {returns.shape}")
+    logger.info(f"  Date range: {returns.index[0]} to {returns.index[-1]}")
+    
+    # Sanity checks
+    logger.info("\nSanity Checks:")
+    logger.info(f"  Mean daily return: {returns.mean().mean()*100:.4f}%")
+    logger.info(f"  Mean annualized return (×252): {returns.mean().mean()*252*100:.2f}%")
+    logger.info(f"  Daily volatility: {returns.std().mean()*100:.4f}%")
+    logger.info(f"  Annualized volatility (×√252): {returns.std().mean()*np.sqrt(252)*100:.2f}%")
+    
+    # Check COVID crash specifically
+    if '2020-03' in returns.index.to_series().astype(str).values:
+        march_2020 = returns.loc['2020-03']
+        logger.info(f"\nMarch 2020 Check:")
+        logger.info(f"  Days of data: {len(march_2020)}")
+        logger.info(f"  Worst daily return: {march_2020.min().min()*100:.2f}%")
+        logger.info(f"  Cumulative return: {(np.exp(march_2020.sum().mean()) - 1)*100:.2f}%")
+    
     if save:
-        out_raw = Path('data/raw/india_asset_prices_wide.parquet')
-        out_raw.parent.mkdir(parents=True, exist_ok=True)
-        # write parquet (requires pyarrow or fastparquet)
-        price_df.to_parquet(out_raw)
-        logger.info(f"✓ Saved raw wide price table to {out_raw}")
-
-        # metadata
-        metadata = {
-            'fetch_date': datetime.now().isoformat(),
-            'requested_assets': tickers,
-            'fetched_assets': list(non_null.columns),
-            'start_date': start,
-            'end_date': end,
-            'n_rows': len(price_df),
-            'n_assets': len(non_null.columns)
-        }
-        meta_path = Path('data/raw/india_asset_prices_metadata.yaml')
-        with open(meta_path, 'w') as f:
-            yaml.dump(metadata, f)
-        logger.info(f"✓ Saved metadata to {meta_path}")
-
-    return price_df
-
-
-def compute_returns(price_df, return_type='log', freq=None, save=True):
-    """
-    Compute returns from the wide price DataFrame.
-
-    Parameters
-    ----------
-    price_df : pd.DataFrame
-        Wide DataFrame (index = dates, columns = tickers)
-    return_type : {'log', 'simple'}
-        Log returns or simple pct-change
-    freq : str or None
-        If provided (e.g., 'M'), resample prices to that frequency first (using last observation).
-    save : bool
-        Save processed returns to parquet.
-
-    Returns
-    -------
-    pd.DataFrame
-        Wide DataFrame of returns
-    """
-    logger.info(f"Computing {return_type} returns (freq={freq})...")
-
-    df = price_df.copy()
-
-    # Optionally resample to monthly/weekly (use last observed price in period)
-    if freq is not None:
-        df = df.resample(freq).last()
-
-    # Compute returns
-    if return_type == 'log':
-        returns = np.log(df / df.shift(1))
-    elif return_type == 'simple':
-        returns = df.pct_change()
-    else:
-        raise ValueError("return_type must be 'log' or 'simple'")
-
-    returns = returns.dropna(how='all').dropna(axis=1, how='all')  # drop all-NaN rows/cols
-    logger.info(f"✓ Computed returns. Shape: {returns.shape}")
-
-    if save:
-        out_path = Path(f'data/processed/india_asset_returns_{return_type}.parquet')
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        returns.to_parquet(out_path)
-        logger.info(f"✓ Saved returns to {out_path}")
-
+        output_path = Path('data/processed/india_asset_returns_daily.parquet')
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        returns.to_parquet(output_path)
+        logger.info(f"\n✓ Saved DAILY returns to {output_path}")
+    
     return returns
 
 
-def get_asset_summary(price_df):
+def create_monthly_returns(daily_returns, save=True):
     """
-    Generate summary statistics for fetched assets (wide price table).
+    Aggregate daily returns to monthly for regime detection
+    
+    Parameters:
+    -----------
+    daily_returns : pd.DataFrame
+        Daily log returns
+        
+    Returns:
+    --------
+    pd.DataFrame : Monthly log returns
     """
-    summary = pd.DataFrame(index=price_df.columns)
-    summary['First Date'] = price_df.apply(lambda s: s.first_valid_index())
-    summary['Last Date'] = price_df.apply(lambda s: s.last_valid_index())
-    summary['Missing Values'] = price_df.isnull().sum()
-    summary['Missing %'] = (price_df.isnull().sum() / len(price_df) * 100).round(2)
-    summary['First Price'] = price_df.apply(lambda s: s.dropna().iloc[0] if not s.dropna().empty else np.nan)
-    summary['Last Price'] = price_df.apply(lambda s: s.dropna().iloc[-1] if not s.dropna().empty else np.nan)
+    
+    logger.info("Creating MONTHLY returns from daily data...")
+    
+    # For log returns, monthly return = sum of daily log returns
+    monthly_returns = daily_returns.resample('M').sum()
+    
+    logger.info(f"✓ Created monthly returns")
+    logger.info(f"  Shape: {monthly_returns.shape}")
+    logger.info(f"  Date range: {monthly_returns.index[0]} to {monthly_returns.index[-1]}")
+    
+    if save:
+        output_path = Path('data/processed/india_asset_returns_monthly.parquet')
+        monthly_returns.to_parquet(output_path)
+        logger.info(f"✓ Saved to {output_path}")
+    
+    return monthly_returns
+
+
+def get_asset_summary(data):
+    """Generate summary statistics"""
+    
+    if isinstance(data.columns, pd.MultiIndex):
+        prices = data.xs('Close', level=1, axis=1)
+    else:
+        prices = data['Close']
+    
+    summary = pd.DataFrame({
+        'First Date': prices.apply(lambda x: x.first_valid_index()),
+        'Last Date': prices.apply(lambda x: x.last_valid_index()),
+        'Trading Days': prices.count(),
+        'Missing Values': prices.isnull().sum(),
+        'Missing %': (prices.isnull().sum() / len(prices) * 100).round(2),
+        'First Price': prices.apply(lambda x: x.iloc[0] if not x.isnull().all() else None),
+        'Last Price': prices.apply(lambda x: x.iloc[-1] if not x.isnull().all() else None),
+    })
+    
     return summary
 
 
 if __name__ == "__main__":
-    # Quick run
-    logger.info("=" * 60)
-    logger.info("FETCHING INDIAN ASSET DATA")
-    logger.info("=" * 60)
-    data = fetch_india_assets()
-
-    logger.info("\n" + "=" * 60)
+    
+    logger.info("="*70)
+    logger.info("FETCHING DAILY INDIAN ASSET DATA (FIXED VERSION)")
+    logger.info("="*70)
+    
+    # Fetch DAILY prices
+    logger.info("\n[Step 1] Fetching DAILY Prices")
+    data = fetch_daily_prices()
+    
+    # Generate summary
+    logger.info("\n" + "="*70)
     logger.info("ASSET SUMMARY")
-    logger.info("=" * 60)
-    print(get_asset_summary(data))
-
-    logger.info("\n" + "=" * 60)
-    logger.info("COMPUTING RETURNS (monthly, log)")
-    logger.info("=" * 60)
-    returns = compute_returns(data, return_type='log', freq='M')
-
-    logger.info("\n" + "=" * 60)
+    logger.info("="*70)
+    summary = get_asset_summary(data)
+    print(summary)
+    
+    # Compute DAILY returns
+    logger.info("\n[Step 2] Computing DAILY Returns")
+    daily_returns = compute_daily_returns(data)
+    
+    # Create MONTHLY returns for regime detection
+    logger.info("\n[Step 3] Creating MONTHLY Returns")
+    monthly_returns = create_monthly_returns(daily_returns)
+    
+    logger.info("\n" + "="*70)
     logger.info("✓ DATA FETCH COMPLETE")
-    logger.info("=" * 60)
+    logger.info("="*70)
+    logger.info("\nGenerated files:")
+    logger.info("  - data/raw/india_asset_prices_daily.parquet (DAILY prices)")
+    logger.info("  - data/processed/india_asset_returns_daily.parquet (DAILY returns)")
+    logger.info("  - data/processed/india_asset_returns_monthly.parquet (MONTHLY returns)")
+    logger.info("\nNext steps:")
+    logger.info("  1. Use MONTHLY returns for regime detection (HMM)")
+    logger.info("  2. Use DAILY returns for backtesting and portfolio analysis")
