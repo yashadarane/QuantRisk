@@ -1,3 +1,15 @@
+# src/models/train_hmm_india.py
+"""
+Robust HMM training for QuantRisk (India)
+
+- KMeans smart init
+- sticky transition initialization
+- multiple restarts to avoid local optima
+- full/diag covariance handling
+- saves model bundle (including scaler + feature order) and regimes parquet
+- small regularization for covariance matrices to avoid singularities
+"""
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -13,7 +25,12 @@ import json
 
 # --- CONFIGURATION ---
 FEATURES_PATH = Path("data/processed/features_hmm_india.parquet")
-RETURNS_PATH = Path("data/processed/india_asset_returns_monthly.parquet") # Needed for interpretation
+# try both common returns file names (monthly log returns or generic monthly)
+RETURNS_PATHS = [
+    Path("data/processed/india_asset_returns_monthly.parquet"),
+    Path("data/processed/india_asset_returns_log.parquet"),
+    Path("data/processed/india_asset_returns.parquet")
+]
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -22,267 +39,264 @@ REGIMES_OUT = Path("data/processed/hmm_regimes_india.parquet")
 SUMMARY_FILE = MODEL_DIR / "hmm_train_summary.json"
 MAPPING_FILE = MODEL_DIR / "state_mapping.json"
 
-# Tuned Hyperparameters
-N_STATES_TO_TRY = [2, 3, 4]
-N_RESTARTS = 10            # CRITICAL: Run fit 10 times per state count to find global optimum
-COV_TYPE = "full"          # 'full' captures correlation between features (Better for Finance)
-N_ITER = 1000              # More iterations for convergence
+# Tuned Hyperparameters (adjustable)
+N_STATES_TO_TRY = [2, 3]    # try a small grid first
+N_RESTARTS = 5                 # number of seeds / restarts per n_states (set <= len(RANDOM_SEEDS))
+COV_TYPE = "diag"              # 'diag' or 'full'
+N_ITER = 500                   # iterations for EM (reduce for quick dev)
 TOLERANCE = 1e-4
-RANDOM_SEEDS = [42, 7, 0, 123, 2023, 11, 13, 17, 99, 101] # Seeds for restarts
+RANDOM_SEEDS = [42, 7, 0, 123, 2023, 11, 13, 17, 99, 101]
 
 # Preprocessing Config
-CLIP_OUTLIERS = True       # Winsorize data to remove extreme spikes (e.g., Covid crash)
-CLIP_Q = (0.01, 0.99)      # Percentiles for clipping
+CLIP_OUTLIERS = False
+CLIP_Q = (0.01, 0.99)
 
 def num_params_gaussian_hmm(n_states, n_features, cov_type="full"):
-    """Calculate the number of free parameters for BIC calculation."""
-    # Start probs: n_states - 1
     start_params = n_states - 1
-    # Trans mat: n_states * (n_states - 1)
     trans_params = n_states * (n_states - 1)
-    # Means: n_states * n_features
     mean_params = n_states * n_features
-    
-    # Covars:
     if cov_type == "diag":
         cov_params = n_states * n_features
-    else: # full
+    else:
         cov_params = n_states * (n_features * (n_features + 1) / 2)
-        
     return int(start_params + trans_params + mean_params + cov_params)
+
 
 def compute_aic_bic(logL, n_params, n_obs):
     aic = 2 * n_params - 2 * logL
     bic = n_params * math.log(n_obs) - 2 * logL
     return aic, bic
 
-def preprocess_data(df):
-    """
-    Standardize and robustly scale the data.
-    HMMs fail if features have vastly different variances.
-    """
-    X = df.values.copy()
-    
-    # 1. Handle NaN/Inf
-    if np.isnan(X).any() or np.isinf(X).any():
-        print("Warning: NaNs or Infs found in features. Filling with 0.")
-        X = np.nan_to_num(X)
 
-    # 2. Winsorize (Clip Outliers)
-    # This prevents one massive crash (like 2020) from creating its own 'state'
+def preprocess_data(df):
+    X = df.values.astype(float).copy()
+
+    # handle NaN / Inf
+    if np.isnan(X).any() or np.isinf(X).any():
+        # Fill with column median (more robust than 0)
+        col_med = np.nanmedian(X, axis=0)
+        inds = np.where(np.isnan(X))
+        X[inds] = np.take(col_med, inds[1])
+        # replace inf with large finite value
+        X[np.isinf(X)] = np.nan
+        inds = np.where(np.isnan(X))
+        X[inds] = np.take(col_med, inds[1])
+        print("Filled NaN/Inf in features using column medians.")
+
+    # optional winsorize / clipping
     if CLIP_OUTLIERS:
         lower = np.percentile(X, CLIP_Q[0] * 100, axis=0)
         upper = np.percentile(X, CLIP_Q[1] * 100, axis=0)
         X = np.clip(X, lower, upper)
+        print("Applied outlier clipping to features.")
 
-    # 3. Standardize (Mean=0, Std=1)
-    # HMMs converge much faster on scaled data
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    
+
     return X_scaled, scaler
 
-def train_one_model(X, n_states, seed):
+
+def init_from_kmeans(X, n_states, seed):
     """
-    Fits a single HMM model with specific initialization logic.
+    KMeans init that returns startprob, means, covars_init, labels
+    covars_init has shape:
+     - diag: (n_states, n_features)
+     - full: (n_states, n_features, n_features)
     """
-    # 1. Smart Initialization using KMeans
-    # We use KMeans to find rough clusters first
     km = KMeans(n_clusters=n_states, random_state=seed, n_init=10).fit(X)
-    
-    # 2. Define Model
-    # init_params="" prevents the model from overwriting our custom initialization
-    model = GaussianHMM(n_components=n_states, covariance_type=COV_TYPE,
-                        n_iter=N_ITER, tol=TOLERANCE, 
-                        random_state=seed, verbose=False,
-                        init_params="") 
+    labels = km.labels_
+    startprob = np.bincount(labels, minlength=n_states) / len(labels)
+    means = km.cluster_centers_
 
-    # 3. "Sticky" Transition Matrix Initialization
-    # We want regimes to be stable. Initialize diagonal with high probability (0.9)
-    # This assumes markets stay in the same state 90% of the time.
-    trans_init = np.ones((n_states, n_states)) * (1.0 - 0.90) / (n_states - 1)
-    np.fill_diagonal(trans_init, 0.90)
-    model.transmat_ = trans_init
-    
-    # 4. Initialize Means from KMeans
-    model.means_ = km.cluster_centers_
-    
-    # 5. Initialize Start Probability
-    model.startprob_ = np.bincount(km.labels_, minlength=n_states) / len(km.labels_)
-
-    # 6. Initialize Covariances
-    # For 'full', calculate empirical covariance of clusters
     n_features = X.shape[1]
-    cv = np.zeros((n_states, n_features, n_features))
-    for s in range(n_states):
-        cluster_data = X[km.labels_ == s]
-        if len(cluster_data) > 2:
-            # Add small regularization (1e-6) to diagonal to prevent singular matrices
-            cv[s] = np.cov(cluster_data.T) + np.eye(n_features) * 1e-6
-        else:
-            cv[s] = np.eye(n_features) # Fallback
-    model.covars_ = cv
+    if COV_TYPE == "diag":
+        covars = np.zeros((n_states, n_features))
+        for s in range(n_states):
+            members = X[labels == s]
+            if len(members) > 1:
+                covars[s, :] = np.var(members, axis=0) + 1e-6
+            else:
+                covars[s, :] = np.var(X, axis=0) + 1e-6
+    else:  # full
+        covars = np.zeros((n_states, n_features, n_features))
+        for s in range(n_states):
+            members = X[labels == s]
+            if len(members) > 2:
+                cov = np.cov(members.T)
+                # regularize
+                cov += np.eye(n_features) * 1e-6
+                covars[s] = cov
+            else:
+                # fallback: global covariance scaled down (more stable)
+                cov = np.cov(X.T)
+                cov += np.eye(n_features) * 1e-6
+                covars[s] = cov
+    return startprob, means, covars, labels
 
-    # 7. Fit
+
+def train_one_model(X, n_states, seed):
+    """Initialize HMM from KMeans, sticky transmat, and fit. Returns model or None."""
+    startprob_init, means_init, covars_init, labels = init_from_kmeans(X, n_states, seed)
+
+    model = GaussianHMM(n_components=n_states,
+                        covariance_type=COV_TYPE,
+                        n_iter=N_ITER,
+                        tol=TOLERANCE,
+                        random_state=seed,
+                        init_params="")  # prevent internal re-init
+
+    # Sticky transition init (high self-transition)
+    stickiness = 0.90
+    trans_init = np.ones((n_states, n_states)) * ((1.0 - stickiness) / max(1, (n_states - 1)))
+    np.fill_diagonal(trans_init, stickiness)
+    model.transmat_ = trans_init
+
+    # set initial parameters
+    model.startprob_ = startprob_init
+    model.means_ = means_init
+    model.covars_ = covars_init
+
     try:
         model.fit(X)
         return model
     except Exception as e:
-        # print(f"Fit failed for seed {seed}: {e}")
+        # fitting may fail (singular cov etc.)
         return None
+
+
+def find_returns_file():
+    for p in RETURNS_PATHS:
+        if p.exists():
+            return p
+    return None
+
 
 def main():
     if not FEATURES_PATH.exists():
         raise FileNotFoundError(f"Features file not found: {FEATURES_PATH}")
 
-    # --- 1. Load and Preprocess ---
+    # 1) Load features and preprocess
     Xdf = pd.read_parquet(FEATURES_PATH)
     print(f"Loaded features {FEATURES_PATH} -> shape {Xdf.shape}")
-    
-    # Apply robust scaling and outlier clipping
+
     X, scaler = preprocess_data(Xdf)
     n_obs, n_features = X.shape
-    
-    # --- 2. Training Loop (Model Selection) ---
+    print(f"Preprocessed features -> shape {X.shape}")
+
     results = []
-    
+
     for n_states in N_STATES_TO_TRY:
         print(f"\n--- Training HMM with n_states={n_states} ---")
-        
-        best_model_n = None
-        best_logL_n = -np.inf
-        
-        # RESTART LOOP: Try different seeds to avoid local minima
-        for i, seed in enumerate(RANDOM_SEEDS[:N_RESTARTS]):
+        best_model_for_n = None
+        best_logL_for_n = -np.inf
+
+        # run multiple restarts (seeds)
+        seeds = RANDOM_SEEDS[:N_RESTARTS]
+        for seed in seeds:
             model = train_one_model(X, n_states, seed)
-            
-            if model is not None:
-                score = model.score(X)
-                
-                # Keep track of the best model for this n_state
-                if score > best_logL_n:
-                    best_logL_n = score
-                    best_model_n = model
-        
-        if best_model_n is None:
+            if model is None:
+                continue
+            try:
+                logL = model.score(X)   # total log-likelihood of observed sequence
+            except Exception:
+                continue
+            if logL > best_logL_for_n:
+                best_logL_for_n = logL
+                best_model_for_n = model
+
+        if best_model_for_n is None:
             print(f"  Failed to fit any model for n_states={n_states}")
             continue
 
-        # Compute Metrics
         n_params = num_params_gaussian_hmm(n_states, n_features, COV_TYPE)
-        aic, bic = compute_aic_bic(best_logL_n, n_params, n_obs)
-        
-        print(f"  >> Best for n={n_states}: LogL={best_logL_n:.2f} | BIC={bic:.2f}")
-        
+        aic, bic = compute_aic_bic(best_logL_for_n, n_params, n_obs)
+        print(f"  >> Best for n={n_states}: LogL={best_logL_for_n:.2f} | AIC={aic:.2f} | BIC={bic:.2f}")
+
         results.append({
             "n_states": n_states,
-            "logL": best_logL_n,
+            "logL": float(best_logL_for_n),
             "n_params": n_params,
-            "AIC": aic,
-            "BIC": bic,
-            "model": best_model_n
+            "AIC": float(aic),
+            "BIC": float(bic),
+            "model": best_model_for_n
         })
 
-    # --- 3. Select Best Model ---
-    # We prefer lower BIC (Bayesian Information Criterion)
     if not results:
-        print("No models converged!")
-        return
+        raise RuntimeError("No models were successfully fitted.")
 
+    # pick best by BIC
     best_result = min(results, key=lambda r: r["BIC"])
     best_states = best_result["n_states"]
     best_model = best_result["model"]
-    
     print(f"\nSELECTED BEST MODEL: n_states={best_states} (BIC={best_result['BIC']:.2f})")
 
-    # --- 4. Save Model ---
+    # Save model bundle (model + scaler + feature names)
     joblib.dump({
         "model": best_model,
-        "scaler": scaler, # SAVE THE SCALER! We need it for inference later
+        "scaler": scaler,
         "feature_columns": Xdf.columns.tolist(),
         "n_states": best_states,
         "cov_type": COV_TYPE
     }, MODEL_FILE)
     print(f"Saved model to {MODEL_FILE}")
 
-    # --- 5. Generate Regimes ---
+    # Predict regimes & posterior probs on the training data
     hidden_states = best_model.predict(X)
     posteriors = best_model.predict_proba(X)
-    
-    out_df = Xdf.copy() # Use original DF for indices
+
+    out_df = Xdf.copy()
     out_df["regime"] = hidden_states
     for i in range(best_states):
         out_df[f"prob_state_{i}"] = posteriors[:, i]
-        
+
     out_df.to_parquet(REGIMES_OUT)
     print(f"Saved regimes to {REGIMES_OUT}")
-    
-    # Save Summary
+
+    # Save training summary (without model object)
     summary_json = [{k: v for k, v in r.items() if k != "model"} for r in results]
     with open(SUMMARY_FILE, "w") as f:
         json.dump(summary_json, f, indent=2)
+    print(f"Saved training summary to {SUMMARY_FILE}")
 
-    # --- 6. Interpret Regimes (Bull/Bear) ---
-    if RETURNS_PATH.exists():
+    # Interpret regimes if returns file exists
+    returns_file = find_returns_file()
+    if returns_file:
         print("\n--- STATE INTERPRETATION ---")
-        m_ret = pd.read_parquet(RETURNS_PATH)
-        # Find the Nifty column dynamically
-        nifty_col = [c for c in m_ret.columns if "NSEI" in c or "NIFTY" in c]
-        
-        if nifty_col:
-            target_col = nifty_col[0]
-            # Join regimes with returns
-            # Ensure indices align (usually datetime)
-            analysis = out_df[["regime"]].join(m_ret[target_col], how="inner")
-            
+        m_ret = pd.read_parquet(returns_file)
+        # detect nifty column case-insensitive
+        nifty_cols = [c for c in m_ret.columns if "NSEI" in c.upper() or "NIFTY" in c.upper()]
+        if nifty_cols:
+            target_col = nifty_cols[0]
+            analysis = out_df[["regime"]].join(m_ret[[target_col]], how="inner")
             stats = analysis.groupby("regime")[target_col].agg(["mean", "std", "count"])
             stats["ann_ret"] = stats["mean"] * 12
             stats["ann_vol"] = stats["std"] * np.sqrt(12)
-            # Add small epsilon to vol to avoid div by zero
-            stats["sharpe"] = stats["ann_ret"] / (stats["ann_vol"] + 1e-6)
-            
+            stats["sharpe"] = stats["ann_ret"] / (stats["ann_vol"] + 1e-9)
             print(stats)
-            
-            # --- ROBUST LOGIC ---
-            # Bear = Lowest Return (often high vol)
+
+            # Robust detection rules
             bear_state = int(stats["ann_ret"].idxmin())
-            
-            # Bull = High Sharpe OR Highest Return
-            # Note: Sometimes the highest return state is a "Rebound" state (very high vol).
-            # We prefer a "Steady Bull" (High Sharpe).
-            
-            # Filter for positive return states only
             positive_states = stats[stats["ann_ret"] > 0]
-            
             if not positive_states.empty:
-                # If we have positive states, pick the one with best risk-adjusted return
                 bull_state = int(positive_states["sharpe"].idxmax())
             else:
-                # If everything is negative (rare), pick the least negative
                 bull_state = int(stats["ann_ret"].idxmax())
 
-            print(f"\nDetected Bull State: {bull_state}")
-            print(f"Detected Bear State: {bear_state}")
-            
             mapping = {
                 "bull_state": bull_state,
                 "bear_state": bear_state,
-                "n_states": best_states
+                "n_states": best_states,
+                "stats": stats.to_dict()
             }
-            
-            # If we have 3+ states, the leftover is usually "Sideways" or "High Volatility"
-            if best_states > 2:
-                all_states = set(range(best_states))
-                others = list(all_states - {bull_state, bear_state})
-                mapping["other_states"] = others
-                
+
             with open(MAPPING_FILE, "w") as f:
                 json.dump(mapping, f, indent=2)
             print(f"Saved state mapping to {MAPPING_FILE}")
         else:
-            print("Could not find NIFTY column in returns file.")
+            print("Could not detect NIFTY column in returns file; skipping interpretation.")
     else:
-        print("Returns file not found. Skipping interpretation.")
+        print("No returns file found; skipping regime interpretation.")
+
 
 if __name__ == "__main__":
     main()
